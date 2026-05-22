@@ -165,7 +165,9 @@ def unload_all(log_path: Optional[Path] = None) -> None:
 
 
 def approx_context_prompt(context_length: int, stress_ratio: float, max_prompt_words: int) -> str:
-    target_words = max(128, int(context_length * stress_ratio))
+    # These synthetic facts tokenize into several tokens each, so keep the word
+    # count well below the requested context length.
+    target_words = max(128, int(context_length * stress_ratio / 4))
     target_words = min(target_words, max_prompt_words)
     facts = []
     for i in range(target_words):
@@ -351,8 +353,27 @@ def call_model(base_url: str, model_id: str, prompt: str, *,
             "tokens": tokens,
             "tps": round(tokens / elapsed, 2) if elapsed > 0 else 0.0,
             "chars": len(content),
+            "content": content,
             "preview": content[:240].replace("\n", "\\n"),
             "error": "",
+        }
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        error = f"HTTP Error {e.code}: {e.reason}"
+        if body:
+            error = f"{error}: {body[:800]}"
+        return {
+            "ok": False,
+            "seconds": round(time.time() - started, 3),
+            "tokens": 0,
+            "tps": 0.0,
+            "chars": 0,
+            "content": "",
+            "preview": "",
+            "error": error[:1000],
         }
     except urllib.error.URLError as e:
         return {
@@ -361,6 +382,7 @@ def call_model(base_url: str, model_id: str, prompt: str, *,
             "tokens": 0,
             "tps": 0.0,
             "chars": 0,
+            "content": "",
             "preview": "",
             "error": str(e)[:1000],
         }
@@ -371,6 +393,7 @@ def call_model(base_url: str, model_id: str, prompt: str, *,
             "tokens": 0,
             "tps": 0.0,
             "chars": 0,
+            "content": "",
             "preview": "",
             "error": str(e)[:1000],
         }
@@ -379,10 +402,10 @@ def call_model(base_url: str, model_id: str, prompt: str, *,
 def response_valid(scenario: Dict, result: Dict) -> bool:
     if not result["ok"]:
         return False
-    preview = result.get("preview", "")
+    content = result.get("content", "")
     required = scenario.get("required") or []
     if required:
-        haystack = preview.lower()
+        haystack = content.lower()
         return all(needle.lower() in haystack for needle in required)
     return result["chars"] > 0
 
@@ -429,7 +452,7 @@ def main() -> None:
     parser.add_argument("--request-timeout", type=int, default=180)
     parser.add_argument("--max-tokens", type=int, default=384,
                         help="Fallback max_tokens for custom scenarios that do not specify max_tokens.")
-    parser.add_argument("--stress-ratio", type=float, default=0.35,
+    parser.add_argument("--stress-ratio", type=float, default=0.25,
                         help="Approximate prompt size as a fraction of context length.")
     parser.add_argument("--max-prompt-words", type=int, default=12000,
                         help="Safety cap for synthetic context prompt size.")
