@@ -60,6 +60,46 @@ Use a non-default LM Studio host or port:
 python gemma4_senior_bench.py --host 127.0.0.1 --port 1234
 ```
 
+## Tuning Context And Parallel Settings
+
+Use `lmstudio_tuning_bench.py` when local models hang, timeout, or become slow
+after loading multiple LLMs together. It is an operational benchmark rather than
+a code-quality benchmark.
+
+For each context-length / parallel-count combination, it:
+
+- unloads all currently loaded models
+- loads both selected models with the same settings
+- keeps both models resident in LM Studio
+- tests one model at a time
+- records load time, response time, TPS, validity, and errors
+
+LM Studio exposes `--context-length` and `--parallel` on `lms load`. It does not
+currently expose a literal CPU thread-pool flag through the CLI, so this script
+uses `--parallel` as the tunable concurrency/thread-pool-like setting.
+
+Dry-run the default two-role setup:
+
+```bash
+python lmstudio_tuning_bench.py --dry-run
+```
+
+Run a focused tuning sweep:
+
+```bash
+python lmstudio_tuning_bench.py \
+  --models gemma-4-31b-dense-platinum,gemma-4-26b-a4b-it-mlx \
+  --context-lengths 4096,8192,16384,32768 \
+  --parallel-values 1,2,4
+```
+
+Results are saved under `results/tuningbench_<timestamp>/` as:
+
+- `results.csv`
+- `results.json`
+- `summary.json`
+- per-combination `lms` logs
+
 ## Results
 
 Results are saved under `results/coderbench_<timestamp>/`:
