@@ -74,6 +74,10 @@ For each context length, it:
 - tests one model at a time with workflow-shaped prompts
 - records load time, response time, TPS, validity, and errors
 
+The tuning benchmark intentionally does not send requests to both models at the
+same time. It tests the workflow we expect to use operationally: both models are
+resident in memory, but requests are routed sequentially to one model at a time.
+
 The built-in scenarios are shaped around the local workflow we have been tuning:
 Codex handoff summaries, BMAD orchestration plans, coding-worker patches,
 review responses, latency probes, and long-context recall.
@@ -90,6 +94,14 @@ Run a focused tuning sweep:
 python lmstudio_tuning_bench.py \
   --models gemma-4-31b-dense-platinum,gemma-4-26b-a4b-it-mlx \
   --context-lengths 4096,8192,16384,32768
+```
+
+Run a wider context sweep, including large-context settings:
+
+```bash
+python lmstudio_tuning_bench.py \
+  --models gemma-4-31b-dense-platinum,gemma-4-26b-a4b-it-mlx \
+  --context-lengths 4096,8192,16384,32768,65000
 ```
 
 Add your own historical failure scenarios with a JSON file:
@@ -115,6 +127,11 @@ Results are saved under `results/tuningbench_<timestamp>/` as:
 - `results.json`
 - `summary.json`
 - per-combination `lms` logs
+
+For operational use, prefer the smallest context length that loads both models
+and passes the workflow-shaped scenarios without timeouts. Larger context values
+are useful when a task genuinely needs long-document handoff, but they can add
+memory pressure without improving normal coding and orchestration work.
 
 ## Results
 
