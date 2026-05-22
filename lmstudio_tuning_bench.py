@@ -2,18 +2,14 @@
 """
 LM Studio operational tuning benchmark.
 
-This benchmark searches for stable LM Studio load settings for one or two local
-models. For each context-length / parallel-count combination it:
+This benchmark searches for stable LM Studio context-length settings for one or
+two local models. For each context length it:
 
     1. Unloads all currently loaded models.
-    2. Loads every requested model with the same setting combination.
-    3. Keeps all requested models resident in parallel.
-    4. Tests one model at a time through LM Studio's OpenAI-compatible API.
+    2. Loads every requested model with that context length.
+    3. Keeps all requested models resident together.
+    4. Tests one model at a time with workflow-shaped prompts.
     5. Records load time, latency, throughput, response validity, and errors.
-
-LM Studio exposes `--context-length` and `--parallel` on `lms load`. It does not
-currently expose a literal CPU thread-pool flag via this CLI, so this script uses
-`--parallel` as the tunable concurrency/thread-pool-like setting.
 """
 
 import argparse
@@ -43,7 +39,6 @@ DEFAULT_MODELS = [
     "gemma-4-26b-a4b-it-mlx",
 ]
 DEFAULT_CONTEXTS = [4096, 8192, 16384, 32768]
-DEFAULT_PARALLEL = [1, 2, 4]
 
 
 def parse_csv_ints(raw: str, *, name: str) -> List[int]:
@@ -138,15 +133,13 @@ def loaded_model_ids(base_url: str) -> List[str]:
         return []
 
 
-def load_model(model_key: str, identifier: str, context_length: int, parallel: int,
+def load_model(model_key: str, identifier: str, context_length: int,
                gpu: str, log_path: Path) -> Dict:
     args = [
         "load",
         model_key,
         "--context-length",
         str(context_length),
-        "--parallel",
-        str(parallel),
         "--identifier",
         identifier,
         "-y",
@@ -190,18 +183,144 @@ def approx_context_prompt(context_length: int, stress_ratio: float, max_prompt_w
     )
 
 
-def short_prompt() -> str:
-    return (
-        "Return exactly this JSON object and no markdown: "
-        '{"status":"ok","task":"latency_probe","answer":42}'
-    )
+def default_scenarios(context_length: int, stress_ratio: float, max_prompt_words: int) -> List[Dict]:
+    context_prompt = approx_context_prompt(context_length, stress_ratio, max_prompt_words)
+    context_required = re.findall(r"fact_\d+=value_\d+", context_prompt.split("Return these exact facts only:", 1)[1])
+    return [
+        {
+            "name": "latency_json",
+            "prompt": (
+                "Return exactly this JSON object and no markdown: "
+                '{"status":"ok","task":"latency_probe","answer":42}'
+            ),
+            "max_tokens": 96,
+            "required": ['"status"', '"ok"', "42"],
+        },
+        {
+            "name": "codex_handoff_summary",
+            "prompt": """You are summarizing a Codex coding session for a local orchestrator.
+
+Conversation facts:
+- User asked to stop an old benchmark after HumanEval/Summary/InfoPres problems.
+- The active project path is /Users/willgomez/Documents/New project/draftbench-main.
+- The successful benchmark backend is LM Studio at http://127.0.0.1:1234/v1.
+- The coding worker is CelesteImperia / Gemma 4 31B (Q4_K_M), model key gemma-4-31b-dense-platinum.
+- The orchestrator is lmstudio-community / Gemma 4 26B A4B Instruct (4bit), model key gemma-4-26b-a4b-it-mlx.
+- The code must continue using BMAD workflow discipline.
+- Do not include old Ollama assumptions.
+- Verification previously used py_compile and dry-run.
+
+Write a concise handoff with exactly these headings:
+Goal
+Decisions
+Files Changed
+Verification
+Risks
+""",
+            "max_tokens": 320,
+            "required": ["Goal", "Decisions", "Files Changed", "Verification", "Risks", "LM Studio", "BMAD"],
+        },
+        {
+            "name": "bmad_orchestrator_plan",
+            "prompt": """You are the principal orchestrator for a BMAD-style coding workflow.
+
+Task: Add a small feature to an existing benchmark without overbuilding.
+Constraints:
+- Inspect the current code first.
+- Keep the change limited to one script and README docs.
+- Do not alter generated results.
+- Ask the coding worker to implement only the approved plan.
+- Verification must include py_compile and a dry-run command.
+- Final response must summarize changed files, checks run, and risks.
+
+Return a compact plan with exactly these headings:
+Scope
+Implementation Plan
+Delegation To Coding Worker
+Verification
+Stop Conditions
+""",
+            "max_tokens": 360,
+            "required": ["Scope", "Implementation Plan", "Delegation To Coding Worker", "Verification", "Stop Conditions"],
+        },
+        {
+            "name": "coding_worker_patch",
+            "prompt": """You are the senior coding worker. Return only Python code, no markdown.
+
+Implement this function:
+
+def summarize_failures(rows):
+    '''
+    rows is a list of dicts with keys:
+    - model_key
+    - test
+    - ok
+    - seconds
+    - error
+
+    Return a dict with:
+    - total_rows
+    - failed_rows
+    - slowest_seconds
+    - failed_models, sorted unique model_key values for rows where ok is false
+    '''
+""",
+            "max_tokens": 320,
+            "required": ["def summarize_failures", "total_rows", "failed_rows", "slowest_seconds", "failed_models"],
+        },
+        {
+            "name": "review_findings",
+            "prompt": """Review this proposed benchmark behavior:
+
+The script loads two local LM Studio models, runs long context prompts, and records latency. It writes JSON and CSV after every context-length test. It ignores generated results in git. It does not run the two models at the same time, but keeps both loaded.
+
+Return a concise code-review style response with exactly these headings:
+Findings
+Missing Tests
+Operational Risks
+Recommended Next Step
+""",
+            "max_tokens": 320,
+            "required": ["Findings", "Missing Tests", "Operational Risks", "Recommended Next Step"],
+        },
+        {
+            "name": "long_context_recall",
+            "prompt": context_prompt,
+            "max_tokens": 160,
+            "required": context_required,
+        },
+    ]
 
 
-def code_prompt() -> str:
-    return (
-        "Write only Python code for a function named add_even_numbers(nums). "
-        "It should return the sum of even integers in nums. No markdown."
-    )
+def load_scenarios(path: Optional[str], context_length: int,
+                   stress_ratio: float, max_prompt_words: int) -> List[Dict]:
+    scenarios = default_scenarios(context_length, stress_ratio, max_prompt_words)
+    if not path:
+        return scenarios
+
+    with open(path) as f:
+        custom = json.load(f)
+    if not isinstance(custom, list):
+        raise ValueError("--scenarios-file must contain a JSON list of scenario objects")
+
+    loaded = []
+    for i, item in enumerate(custom, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Scenario {i} is not an object")
+        name = str(item.get("name") or f"custom_{i}")
+        prompt = item.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"Scenario {name!r} is missing a non-empty prompt")
+        required = item.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(v, str) for v in required):
+            raise ValueError(f"Scenario {name!r} required must be a list of strings")
+        loaded.append({
+            "name": name,
+            "prompt": prompt,
+            "max_tokens": int(item.get("max_tokens") or 320),
+            "required": required,
+        })
+    return scenarios + loaded
 
 
 def call_model(base_url: str, model_id: str, prompt: str, *,
@@ -257,16 +376,14 @@ def call_model(base_url: str, model_id: str, prompt: str, *,
         }
 
 
-def response_valid(test_name: str, result: Dict) -> bool:
+def response_valid(scenario: Dict, result: Dict) -> bool:
     if not result["ok"]:
         return False
     preview = result.get("preview", "")
-    if test_name == "short":
-        return '"status"' in preview and '"ok"' in preview and "42" in preview
-    if test_name == "code":
-        return "def add_even_numbers" in preview and "sum" in preview
-    if test_name == "context":
-        return "fact_" in preview and "value_" in preview
+    required = scenario.get("required") or []
+    if required:
+        haystack = preview.lower()
+        return all(needle.lower() in haystack for needle in required)
     return result["chars"] > 0
 
 
@@ -288,9 +405,9 @@ def summarize_combo(rows: List[Dict]) -> Dict:
 
 def write_csv(path: Path, rows: List[Dict]) -> None:
     fieldnames = [
-        "run_id", "context_length", "parallel", "model_key", "api_model_id",
-        "phase", "test", "ok", "valid", "seconds", "tps", "tokens", "chars",
-        "load_seconds", "error", "preview",
+        "run_id", "context_length", "model_key", "api_model_id", "phase",
+        "scenario", "ok", "valid", "seconds", "tps", "tokens", "chars",
+        "load_seconds", "required", "error", "preview",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -300,42 +417,49 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Tune LM Studio context length and parallel settings.")
+    parser = argparse.ArgumentParser(description="Tune LM Studio context length with workflow-shaped scenarios.")
     parser.add_argument("--models", type=parse_csv_strings, default=DEFAULT_MODELS,
                         help="Comma-separated LM Studio model keys to load together.")
     parser.add_argument("--context-lengths", type=lambda v: parse_csv_ints(v, name="context-lengths"),
                         default=DEFAULT_CONTEXTS,
                         help="Comma-separated context lengths to test.")
-    parser.add_argument("--parallel-values", type=lambda v: parse_csv_ints(v, name="parallel-values"),
-                        default=DEFAULT_PARALLEL,
-                        help="Comma-separated LM Studio --parallel values to test.")
     parser.add_argument("--host", default=LM_STUDIO_HOST)
     parser.add_argument("--port", type=int, default=LM_STUDIO_PORT)
     parser.add_argument("--gpu", default="", help='Optional LM Studio --gpu value, e.g. "max", "off", or "0.5".')
     parser.add_argument("--request-timeout", type=int, default=180)
-    parser.add_argument("--max-tokens", type=int, default=192)
+    parser.add_argument("--max-tokens", type=int, default=384,
+                        help="Fallback max_tokens for custom scenarios that do not specify max_tokens.")
     parser.add_argument("--stress-ratio", type=float, default=0.35,
                         help="Approximate prompt size as a fraction of context length.")
     parser.add_argument("--max-prompt-words", type=int, default=12000,
                         help="Safety cap for synthetic context prompt size.")
+    parser.add_argument("--scenarios-file", default="",
+                        help="Optional JSON list of additional scenarios with name, prompt, required, max_tokens.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if args.stress_ratio <= 0 or args.stress_ratio > 1:
         raise SystemExit("--stress-ratio must be greater than 0 and less than or equal to 1")
 
-    combos = [(ctx, par) for ctx in args.context_lengths for par in args.parallel_values]
     base_url = server_url(args.host, args.port)
+    dry_run_scenarios = load_scenarios(
+        args.scenarios_file or None,
+        args.context_lengths[0],
+        args.stress_ratio,
+        args.max_prompt_words,
+    )
 
     print("LM Studio tuning benchmark")
     print(f"Endpoint: {base_url}")
     print(f"Models:   {', '.join(args.models)}")
     print(f"Contexts: {', '.join(map(str, args.context_lengths))}")
-    print(f"Parallel: {', '.join(map(str, args.parallel_values))}")
-    print(f"Combos:   {len(combos)}")
-    print("Note: LM Studio CLI exposes --parallel, not a literal CPU thread-pool flag.")
+    print(f"Scenarios: {len(dry_run_scenarios)} workflow-shaped prompt(s)")
+    print(f"Combos:   {len(args.context_lengths)}")
 
     if args.dry_run:
+        for scenario in dry_run_scenarios:
+            required = scenario.get("required") or []
+            print(f"  - {scenario['name']} ({len(required)} required marker(s))")
         return
 
     ensure_server(base_url)
@@ -347,27 +471,32 @@ def main() -> None:
     summary_rows: List[Dict] = []
 
     try:
-        for combo_index, (context_length, parallel) in enumerate(combos, 1):
-            print(f"\n[{combo_index}/{len(combos)}] context={context_length} parallel={parallel}")
-            log_path = run_dir / f"ctx{context_length}_parallel{parallel}.log"
+        for combo_index, context_length in enumerate(args.context_lengths, 1):
+            print(f"\n[{combo_index}/{len(args.context_lengths)}] context={context_length}")
+            log_path = run_dir / f"ctx{context_length}.log"
             unload_all(log_path)
+            scenarios = load_scenarios(
+                args.scenarios_file or None,
+                context_length,
+                args.stress_ratio,
+                args.max_prompt_words,
+            )
 
             combo_rows: List[Dict] = []
             identifiers: Dict[str, str] = {}
             load_failed = False
             for model_index, model_key in enumerate(args.models, 1):
-                identifier = f"tune_{model_index}_{slug(model_key)}_ctx{context_length}_p{parallel}"
+                identifier = f"tune_{model_index}_{slug(model_key)}_ctx{context_length}"
                 identifiers[model_key] = identifier
                 print(f"  Loading {model_key} as {identifier}")
-                load = load_model(model_key, identifier, context_length, parallel, args.gpu, log_path)
+                load = load_model(model_key, identifier, context_length, args.gpu, log_path)
                 row = {
                     "run_id": run_id,
                     "context_length": context_length,
-                    "parallel": parallel,
                     "model_key": model_key,
                     "api_model_id": identifier,
                     "phase": "load",
-                    "test": "load",
+                    "scenario": "load",
                     "ok": load["load_ok"],
                     "valid": load["load_ok"],
                     "seconds": load["load_seconds"],
@@ -375,6 +504,7 @@ def main() -> None:
                     "tokens": "",
                     "chars": "",
                     "load_seconds": load["load_seconds"],
+                    "required": "",
                     "error": load["load_error"],
                     "preview": "",
                 }
@@ -387,31 +517,27 @@ def main() -> None:
             print(f"  Loaded API ids: {', '.join(loaded_model_ids(base_url))}")
 
             if not load_failed:
-                prompts = {
-                    "short": short_prompt(),
-                    "code": code_prompt(),
-                    "context": approx_context_prompt(context_length, args.stress_ratio, args.max_prompt_words),
-                }
                 for model_key in args.models:
                     model_id = identifiers[model_key]
-                    for test_name, prompt in prompts.items():
-                        print(f"  Testing {model_key} [{test_name}]")
+                    for scenario in scenarios:
+                        scenario_name = scenario["name"]
+                        max_tokens = int(scenario.get("max_tokens") or args.max_tokens)
+                        print(f"  Testing {model_key} [{scenario_name}]")
                         result = call_model(
                             base_url,
                             model_id,
-                            prompt,
-                            max_tokens=args.max_tokens,
+                            scenario["prompt"],
+                            max_tokens=max_tokens,
                             timeout=args.request_timeout,
                         )
-                        valid = response_valid(test_name, result)
+                        valid = response_valid(scenario, result)
                         row = {
                             "run_id": run_id,
                             "context_length": context_length,
-                            "parallel": parallel,
                             "model_key": model_key,
                             "api_model_id": model_id,
                             "phase": "test",
-                            "test": test_name,
+                            "scenario": scenario_name,
                             "ok": result["ok"],
                             "valid": valid,
                             "seconds": result["seconds"],
@@ -419,6 +545,7 @@ def main() -> None:
                             "tokens": result["tokens"],
                             "chars": result["chars"],
                             "load_seconds": "",
+                            "required": "; ".join(scenario.get("required") or []),
                             "error": result["error"],
                             "preview": result["preview"],
                         }
@@ -431,7 +558,6 @@ def main() -> None:
             combo_summary.update({
                 "run_id": run_id,
                 "context_length": context_length,
-                "parallel": parallel,
             })
             summary_rows.append(combo_summary)
 
@@ -449,7 +575,7 @@ def main() -> None:
             best = sorted(successful, key=lambda r: (r["max_test_seconds"], -r["avg_tps"]))[0]
             print(
                 "\nRecommended stable setting: "
-                f"context={best['context_length']} parallel={best['parallel']} "
+                f"context={best['context_length']} "
                 f"(max response {best['max_test_seconds']:.3f}s, avg TPS {best['avg_tps']})"
             )
         else:
